@@ -9,10 +9,10 @@ import plotly.graph_objects as go
 # ==============================================================================
 # CONFIGURACIÓN
 # ==============================================================================
-st.set_page_config(page_title="Auditoría Master CONTPAQ", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Auditoría Master Farmers", layout="wide", page_icon="🛡️")
 UMBRAL_TOLERANCIA = 1.0 
 
-st.title("🛡️ Auditoría Master de Saldos (Contpaq)")
+st.title("🛡️ Auditoría Master de Saldos (Farmers)")
 st.markdown("""
 Esta herramienta está adaptada para el nuevo formato de reporte (CSV):
 1. **Lectura Blindada:** Detecta cuentas, saldos iniciales y cruza referencias automáticamente.
