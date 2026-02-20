@@ -289,4 +289,4 @@ if uploaded_file:
         st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.info("Esperando archivo CSV de CONTPAQ...")
+    st.info("Esperando archivo CSV de PLATAFORMA...")
