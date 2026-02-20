@@ -8,10 +8,10 @@ import plotly.graph_objects as go
 # ==============================================================================
 # CONFIGURACIÓN
 # ==============================================================================
-st.set_page_config(page_title="Auditoría Master CONTPAQ", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Auditoría Master FARMERS", layout="wide", page_icon="🛡️")
 UMBRAL_TOLERANCIA = 1.0 
 
-st.title("🛡️ Auditoría Master de Saldos (Contpaq)")
+st.title("🛡️🍴 Auditoría Master de Saldos (FARMERS)")
 st.markdown("""
 Esta herramienta está adaptada para el formato de reporte CSV y extrae inteligencia de negocio:
 1. **Lectura Blindada:** Cuadra el saldo inicial con los movimientos.
@@ -296,4 +296,4 @@ if uploaded_file:
         st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.info("Esperando archivo CSV de CONTPAQ...")
+    st.info("Esperando archivo CSV de PLATAFORMA...")
