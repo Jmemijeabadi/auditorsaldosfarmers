@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="Auditoría Master FARMERS", layout="wide", page_icon="🛡️")
 UMBRAL_TOLERANCIA = 1.0 
 
-st.title("🛡️ Auditoría Master de Saldos (FARMERS)")
+st.title("🛡️🍴 Auditoría Master de Saldos (FARMERS)")
 st.markdown("""
 Esta herramienta está adaptada para el formato de reporte CSV y extrae inteligencia de negocio:
 1. **Lectura Blindada:** Cuadra el saldo inicial con los movimientos.
