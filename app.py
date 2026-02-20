@@ -16,7 +16,7 @@ st.markdown("""
 Esta herramienta está adaptada para el formato de reporte CSV y extrae inteligencia de negocio:
 1. **Lectura Blindada:** Cuadra el saldo inicial con los movimientos.
 2. **Inteligencia Operativa:** Identifica el nombre del cliente por factura.
-3. **Radar de Errores:** Detecta facturas pendientes y pagos sin factura origen (anticipos).
+3. **Radar de Errores:** Separa las deudas reales de los pagos de periodos anteriores.
 """)
 
 # ==============================================================================
@@ -99,7 +99,7 @@ def procesar_contpaq_engine(file):
         4: "cargos", 
         5: "abonos", 
         6: "saldo_acumulado",
-        7: "desc_linea" # Aquí suele venir "CXC CLIENTE" en los cargos
+        7: "desc_linea"
     }
     movs = movs.rename(columns=col_map)
     
@@ -110,11 +110,9 @@ def procesar_contpaq_engine(file):
     movs["fecha"] = pd.to_datetime(movs["fecha_raw"], errors="coerce")
     movs["referencia_norm"] = movs["referencia"].apply(normalizar_referencia_base)
     
-    # NUEVO: Cálculo vectorizado para evitar lentitud
     movs["saldo_neto"] = movs["cargos"] - movs["abonos"]
     
-    # NUEVO: Extracción Inteligente de Cliente
-    # Si hay cargo, el cliente está en 'desc_linea' (quitando 'CXC '). Si hay abono, está en 'concepto'.
+    # Extracción Inteligente de Cliente
     movs["cliente"] = np.where(
         movs["cargos"] > 0, 
         movs["desc_linea"].astype(str).str.replace(r"^CXC\s+", "", regex=True).str.strip(), 
@@ -133,7 +131,7 @@ def procesar_contpaq_engine(file):
     return movs, resumen
 
 # ==============================================================================
-# 3. LÓGICA DE NEGOCIO (EL VALOR AGREGADO)
+# 3. LÓGICA DE NEGOCIO
 # ==============================================================================
 
 def analizar_saldos(movs, resumen):
@@ -169,24 +167,33 @@ if uploaded_file:
             movs_validos = movs[movs["referencia_norm"].notna()]
             
             resumen_referencias = movs_validos.groupby(["meta_codigo", "referencia_norm"]).agg(
-                cliente=("cliente", "first"), # Tomamos el primer nombre de cliente que encuentre
+                cliente=("cliente", "first"),
                 fecha_origen=("fecha", "min"),
                 total_cargos=("cargos", "sum"),
                 total_abonos=("abonos", "sum"),
                 saldo_pendiente=("saldo_neto", "sum")
             ).reset_index()
             
-            # 1. Facturas Pendientes de Cobro (Tienen saldo mayor a cero)
-            facturas_pend = resumen_referencias[resumen_referencias["saldo_pendiente"].abs() > 0.01].copy()
+            # 1. Facturas Pendientes (Tienen cargos en el periodo y aún deben saldo)
+            facturas_pend = resumen_referencias[
+                (resumen_referencias["total_cargos"] > 0) & 
+                (resumen_referencias["saldo_pendiente"] > 0.01)
+            ].copy()
             
-            # 2. Pagos sin Factura (Abonos huérfanos sin un cargo original)
+            # 2. Pagos sin Factura (Abonos de meses anteriores o anticipos)
             pagos_huerfanos = resumen_referencias[
                 (resumen_referencias["total_cargos"] == 0) & 
                 (resumen_referencias["total_abonos"] > 0)
             ].copy()
+
+            # 3. Facturas Pagadas de Más (Tienen cargo, pero el abono fue mayor)
+            pagos_excedentes = resumen_referencias[
+                (resumen_referencias["total_cargos"] > 0) & 
+                (resumen_referencias["saldo_pendiente"] < -0.01)
+            ].copy()
             
         except Exception as e:
-            st.error(f"Error procesando: {e}")
+            st.error(f"Error procesando el archivo: {e}")
             st.stop()
             
     # KPIs Globales
@@ -197,14 +204,14 @@ if uploaded_file:
     
     col1.metric("Saldo Contable Total", f"${saldo_total:,.2f}")
     col2.metric("Diferencia Matemática", f"${diferencia_total:,.2f}", delta_color="inverse")
-    col3.metric("Pagos sin Factura (Huérfanos)", len(pagos_huerfanos), delta_color="inverse")
-    col4.metric("Facturas con Saldo Pendiente", len(facturas_pend))
+    col3.metric("Pagos sin Factura / Excedentes", len(pagos_huerfanos) + len(pagos_excedentes), delta_color="inverse")
+    col4.metric("Facturas por Cobrar", len(facturas_pend))
 
     # Pestañas
-    t1, t2, t3, t4 = st.tabs(["🚦 Semáforo Contable", "📑 Facturas Pendientes", "❓ Pagos sin Factura", "📉 Gráficos"])
+    t1, t2, t3, t4 = st.tabs(["🚦 Semáforo Contable", "📑 Facturas Pendientes", "❓ Abonos Antiguos / Excedentes", "📉 Gráficos"])
     
     with t1:
-        st.subheader("Conciliación de la Matemática de las Cuentas")
+        st.subheader("Conciliación Matemática de las Cuentas")
         ver_todo = st.toggle("Ver solo cuentas con diferencias", value=False)
         df_show = df_audit[df_audit["estado"] != "🟢 OK"] if ver_todo else df_audit
         
@@ -214,7 +221,7 @@ if uploaded_file:
             column_config={
                 "meta_saldo_inicial": st.column_config.NumberColumn("Saldo Inicial", format="$%.2f"),
                 "movimientos_netos": st.column_config.NumberColumn("Neto (Cargos-Abonos)", format="$%.2f"),
-                "saldo_calculado": st.column_config.NumberColumn("Saldo Calculado", format="$%.2f"),
+                "saldo_calculado": st.column_config.NumberColumn("Saldo Teórico", format="$%.2f"),
                 "saldo_final_aux": st.column_config.NumberColumn("Saldo Reporte", format="$%.2f"),
                 "diferencia": st.column_config.NumberColumn("Diferencia", format="$%.2f"),
             }
@@ -222,27 +229,27 @@ if uploaded_file:
         st.download_button("Descargar Semáforo", to_excel(df_audit), "semaforo.xlsx")
         
     with t2:
-        st.subheader("Detalle Operativo de Cobranza (Facturas Vivas)")
+        st.subheader("Detalle Operativo de Cobranza (Cartera Viva)")
         st.dataframe(
             facturas_pend[["cliente", "referencia_norm", "fecha_origen", "total_cargos", "total_abonos", "saldo_pendiente"]].sort_values("fecha_origen"),
             use_container_width=True,
             column_config={
                 "cliente": "Cliente",
                 "referencia_norm": "Factura",
-                "fecha_origen": st.column_config.DateColumn("Fecha Inicial", format="DD/MM/YYYY"),
+                "fecha_origen": st.column_config.DateColumn("Fecha Cargo", format="DD/MM/YYYY"),
                 "total_cargos": st.column_config.NumberColumn("Cargos", format="$%.2f"),
                 "total_abonos": st.column_config.NumberColumn("Abonos", format="$%.2f"),
                 "saldo_pendiente": st.column_config.NumberColumn("Saldo por Cobrar", format="$%.2f")
             }
         )
-        st.download_button("Descargar Pendientes", to_excel(facturas_pend), "pendientes_cobro.xlsx")
+        st.download_button("Descargar Facturas Pendientes", to_excel(facturas_pend), "pendientes_cobro.xlsx")
         
     with t3:
-        st.subheader("Pagos o Anticipos sin Factura Asociada")
+        st.subheader("Pagos de Periodos Anteriores o Anticipos (Sin cargo de origen)")
         if pagos_huerfanos.empty:
-            st.success("✅ Excelente: Todos los pagos tienen su factura correspondiente.")
+            st.success("✅ No hay pagos huérfanos.")
         else:
-            st.warning("⚠️ Ojo: Estos abonos se registraron, pero no se encontró la factura de origen en este reporte.")
+            st.warning("⚠️ Estos abonos se registraron, pero no se encontró la factura (probablemente son de un ejercicio anterior).")
             st.dataframe(
                 pagos_huerfanos[["cliente", "referencia_norm", "fecha_origen", "total_abonos", "saldo_pendiente"]],
                 use_container_width=True,
@@ -252,6 +259,24 @@ if uploaded_file:
                     "fecha_origen": st.column_config.DateColumn("Fecha del Pago", format="DD/MM/YYYY"),
                     "total_abonos": st.column_config.NumberColumn("Monto del Abono", format="$%.2f"),
                     "saldo_pendiente": st.column_config.NumberColumn("Saldo a Favor", format="$%.2f")
+                }
+            )
+            
+        st.divider()
+        st.subheader("Facturas con Pago Excedente")
+        if pagos_excedentes.empty:
+            st.success("✅ No hay facturas pagadas de más.")
+        else:
+            st.info("ℹ️ Estas facturas tienen un abono mayor al cargo registrado en este periodo.")
+            st.dataframe(
+                pagos_excedentes[["cliente", "referencia_norm", "total_cargos", "total_abonos", "saldo_pendiente"]],
+                use_container_width=True,
+                column_config={
+                    "cliente": "Cliente",
+                    "referencia_norm": "Factura",
+                    "total_cargos": st.column_config.NumberColumn("Cargos", format="$%.2f"),
+                    "total_abonos": st.column_config.NumberColumn("Abonos", format="$%.2f"),
+                    "saldo_pendiente": st.column_config.NumberColumn("Excedente a Favor", format="$%.2f")
                 }
             )
             
