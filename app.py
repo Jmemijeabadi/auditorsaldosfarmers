@@ -136,7 +136,7 @@ def analizar_saldos(movs, resumen):
 # APP UI
 # ==============================================================================
 
-uploaded_file = st.file_uploader("📂 Sube reporte CONTPAQ (CSV extraído de la plataforma)", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("📂 Sube reporte (CSV extraído de la plataforma)", type=["xlsx", "csv"])
 
 if uploaded_file:
     with st.spinner("🚀 Extrayendo clientes y generando análisis..."):
