@@ -2,21 +2,21 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
-import unicodedata
 from io import BytesIO
 import plotly.graph_objects as go
 
 # ==============================================================================
 # CONFIGURACIÓN
 # ==============================================================================
-st.set_page_config(page_title="Auditoría Master Farmers", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Auditoría Master CONTPAQ", layout="wide", page_icon="🛡️")
 UMBRAL_TOLERANCIA = 1.0 
 
-st.title("🛡️ Auditoría Master de Saldos (Farmers)")
+st.title("🛡️ Auditoría Master de Saldos (Contpaq)")
 st.markdown("""
-Esta herramienta está adaptada para el nuevo formato de reporte (CSV):
-1. **Lectura Blindada:** Detecta cuentas, saldos iniciales y cruza referencias automáticamente.
-2. **Lógica de Negocio:** Detecta cruces de cuentas, facturas pendientes y cuadra el saldo inicial con los movimientos.
+Esta herramienta está adaptada para el formato de reporte CSV y extrae inteligencia de negocio:
+1. **Lectura Blindada:** Cuadra el saldo inicial con los movimientos.
+2. **Inteligencia Operativa:** Identifica el nombre del cliente por factura.
+3. **Radar de Errores:** Detecta facturas pendientes y pagos sin factura origen (anticipos).
 """)
 
 # ==============================================================================
@@ -30,15 +30,15 @@ def normalizar_referencia_base(ref):
     if pd.isna(ref): return None
     s = str(ref).strip().upper()
     
-    # Si es un pago referenciando a factura: Ej. "Ap. Pago Cte. 1071 F. 2766" -> extrae 2766
+    # Extrae el número de factura de los pagos
     m_pago = re.search(r'F\.?\s*(\d+)', s)
     if m_pago: return m_pago.group(1)
     
-    # Si es el alta de la factura: Ej. "Factura de Cliente A-2779" -> extrae 2779
+    # Extrae el número de factura de los cargos
     m_fac = re.search(r'A\s*-\s*(\d+)', s)
     if m_fac: return m_fac.group(1)
     
-    # Fallback: extrae el último bloque numérico que encuentre
+    # Fallback: extrae el último bloque numérico
     m_num = re.findall(r'\d+', s)
     if m_num: return m_num[-1]
     
@@ -59,7 +59,7 @@ def to_excel(df):
     return output.getvalue()
 
 # ==============================================================================
-# 2. PROCESAMIENTO CENTRAL (ENGINE PARA NUEVO FORMATO)
+# 2. PROCESAMIENTO CENTRAL (ENGINE)
 # ==============================================================================
 
 @st.cache_data
@@ -67,7 +67,7 @@ def procesar_contpaq_engine(file):
     raw = cargar_archivo_robusto(file)
     raw_str = raw.astype(str)
     
-    # 1. Detectar Cuentas (Formato: 104-001-001 en Col 0, nombre en Col 2)
+    # 1. Detectar Cuentas
     patron_cuenta = r"^\d{3}-\d{3}-\d{3}"
     is_cuenta = raw_str[0].str.match(patron_cuenta, na=False)
     
@@ -78,40 +78,50 @@ def procesar_contpaq_engine(file):
     df["meta_codigo"] = df["meta_codigo"].ffill()
     df["meta_nombre"] = df["meta_nombre"].ffill()
     
-    # 2. Detectar Saldo Inicial (Dice "Saldo Inicial" en Col 3, valor en Col 6)
+    # 2. Detectar Saldo Inicial
     is_saldo_ini = raw_str[3].str.contains("Saldo Inicial", case=False, na=False)
     df["meta_saldo_inicial_row"] = np.where(is_saldo_ini, pd.to_numeric(df[6], errors='coerce'), np.nan)
     
-    # Mapear el saldo inicial a todas las filas de su respectiva cuenta
     saldos_dict = df.dropna(subset=["meta_saldo_inicial_row"]).set_index("meta_codigo")["meta_saldo_inicial_row"].to_dict()
     df["meta_saldo_inicial"] = df["meta_codigo"].map(saldos_dict).fillna(0)
     
-    # 3. Detectar Movimientos (Tienen fecha formato YYYY-MM-DD en Col 1)
+    # 3. Detectar Movimientos
     patron_fecha = r"^\d{4}-\d{2}-\d{2}"
     is_mov = raw_str[1].str.match(patron_fecha, na=False)
     movs = df[is_mov].copy()
     
-    # 4. Mapear y Limpiar Columnas
+    # 4. Mapear Columnas
     col_map = {
         0: "poliza", 
         1: "fecha_raw", 
-        2: "concepto",       # Ej: Nombre de cliente o "Factura de..."
-        3: "referencia",     # Columna donde viene el detalle F. 2766 o A-2779
+        2: "concepto",       
+        3: "referencia",     
         4: "cargos", 
         5: "abonos", 
-        6: "saldo_acumulado"
+        6: "saldo_acumulado",
+        7: "desc_linea" # Aquí suele venir "CXC CLIENTE" en los cargos
     }
     movs = movs.rename(columns=col_map)
     
+    # 5. Limpieza y Optimización Matemática
     for c in ["cargos", "abonos", "saldo_acumulado"]:
         movs[c] = pd.to_numeric(movs[c], errors='coerce').fillna(0)
         
     movs["fecha"] = pd.to_datetime(movs["fecha_raw"], errors="coerce")
-    
-    # 5. Aplicar Mapeo Inteligente (Extracción de # Factura)
     movs["referencia_norm"] = movs["referencia"].apply(normalizar_referencia_base)
     
-    # 6. Totales Auxiliar (Tomamos el último saldo acumulado como saldo final)
+    # NUEVO: Cálculo vectorizado para evitar lentitud
+    movs["saldo_neto"] = movs["cargos"] - movs["abonos"]
+    
+    # NUEVO: Extracción Inteligente de Cliente
+    # Si hay cargo, el cliente está en 'desc_linea' (quitando 'CXC '). Si hay abono, está en 'concepto'.
+    movs["cliente"] = np.where(
+        movs["cargos"] > 0, 
+        movs["desc_linea"].astype(str).str.replace(r"^CXC\s+", "", regex=True).str.strip(), 
+        movs["concepto"].astype(str).str.strip()
+    )
+    
+    # 6. Totales Auxiliar
     if not movs.empty:
         resumen = movs.groupby(["meta_codigo", "meta_nombre"]).agg(
             saldo_final_aux=("saldo_acumulado", "last")
@@ -123,45 +133,16 @@ def procesar_contpaq_engine(file):
     return movs, resumen
 
 # ==============================================================================
-# 3. LÓGICA DE NEGOCIO
+# 3. LÓGICA DE NEGOCIO (EL VALOR AGREGADO)
 # ==============================================================================
 
-@st.cache_data
-def detectar_cruces(movs):
-    """Detecta facturas que tocan múltiples cuentas."""
-    validos = movs[movs["referencia_norm"].notna()]
-    
-    por_cuenta = validos.groupby(["referencia_norm", "meta_codigo", "meta_nombre"]).agg(
-        cargos=("cargos", "sum"),
-        abonos=("abonos", "sum")
-    ).reset_index()
-    
-    por_cuenta["tiene_cargo"] = por_cuenta["cargos"] > 0
-    por_cuenta["tiene_abono"] = por_cuenta["abonos"] > 0
-    
-    nivel_ref = por_cuenta.groupby("referencia_norm").agg(
-        num_cuentas=("meta_codigo", "nunique"),
-        hay_cargo=("tiene_cargo", "max"),
-        hay_abono=("tiene_abono", "max")
-    ).reset_index()
-    
-    cruces = nivel_ref[ (nivel_ref["num_cuentas"] > 1) & nivel_ref["hay_cargo"] & nivel_ref["hay_abono"] ]
-    
-    if cruces.empty:
-        return pd.DataFrame()
-    
-    detalle = por_cuenta[por_cuenta["referencia_norm"].isin(cruces["referencia_norm"])].copy()
-    detalle["saldo_en_cuenta"] = detalle["cargos"] - detalle["abonos"]
-    return detalle.sort_values("referencia_norm")
-
 def analizar_saldos(movs, resumen):
-    """Construye la tabla maestra de auditoría (Semáforo)."""
+    """Construye la tabla maestra de auditoría contable."""
     vivas = movs[movs["referencia_norm"].notna()]
-    saldo_facturas = vivas.groupby(["meta_codigo"]).apply(lambda x: (x["cargos"] - x["abonos"]).sum()).reset_index(name="movimientos_netos")
+    saldo_facturas = vivas.groupby(["meta_codigo"]).agg(movimientos_netos=("saldo_neto", "sum")).reset_index()
     
     df = resumen.merge(saldo_facturas, on="meta_codigo", how="left").fillna(0)
     
-    # El saldo teórico debería ser: Saldo Inicial + (Cargos - Abonos)
     df["saldo_calculado"] = df["meta_saldo_inicial"] + df["movimientos_netos"]
     df["diferencia"] = df["saldo_final_aux"] - df["saldo_calculado"]
     
@@ -176,23 +157,33 @@ def analizar_saldos(movs, resumen):
 # APP UI
 # ==============================================================================
 
-uploaded_file = st.file_uploader("📂 Sube reporte CONTPAQ (Excel o CSV)", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("📂 Sube reporte CONTPAQ (CSV extraído de la plataforma)", type=["xlsx", "csv"])
 
 if uploaded_file:
-    with st.spinner("🚀 Procesando archivo..."):
+    with st.spinner("🚀 Extrayendo clientes y calculando saldos..."):
         try:
             movs, resumen = procesar_contpaq_engine(uploaded_file)
-            
             df_audit = analizar_saldos(movs, resumen)
-            df_cruces = detectar_cruces(movs)
             
-            # Facturas Pendientes (Detalle)
+            # AGRUPACIÓN OPTIMIZADA POR REFERENCIA
             movs_validos = movs[movs["referencia_norm"].notna()]
-            facturas_pend = movs_validos.groupby(["meta_codigo", "meta_nombre", "referencia_norm"]).agg(
-                fecha=("fecha", "min"),
-                saldo=("cargos", lambda x: x.sum() - movs_validos.loc[x.index, "abonos"].sum())
+            
+            resumen_referencias = movs_validos.groupby(["meta_codigo", "referencia_norm"]).agg(
+                cliente=("cliente", "first"), # Tomamos el primer nombre de cliente que encuentre
+                fecha_origen=("fecha", "min"),
+                total_cargos=("cargos", "sum"),
+                total_abonos=("abonos", "sum"),
+                saldo_pendiente=("saldo_neto", "sum")
             ).reset_index()
-            facturas_pend = facturas_pend[facturas_pend["saldo"].abs() > 0.01]
+            
+            # 1. Facturas Pendientes de Cobro (Tienen saldo mayor a cero)
+            facturas_pend = resumen_referencias[resumen_referencias["saldo_pendiente"].abs() > 0.01].copy()
+            
+            # 2. Pagos sin Factura (Abonos huérfanos sin un cargo original)
+            pagos_huerfanos = resumen_referencias[
+                (resumen_referencias["total_cargos"] == 0) & 
+                (resumen_referencias["total_abonos"] > 0)
+            ].copy()
             
         except Exception as e:
             st.error(f"Error procesando: {e}")
@@ -205,16 +196,16 @@ if uploaded_file:
     diferencia_total = df_audit["diferencia"].sum()
     
     col1.metric("Saldo Contable Total", f"${saldo_total:,.2f}")
-    col2.metric("Diferencia sin Soporte", f"${diferencia_total:,.2f}", delta_color="inverse")
-    col3.metric("Facturas con Cruce", len(df_cruces["referencia_norm"].unique()) if not df_cruces.empty else 0)
-    col4.metric("Cuentas con Error", len(df_audit[df_audit["estado"].str.contains("🔴")]))
+    col2.metric("Diferencia Matemática", f"${diferencia_total:,.2f}", delta_color="inverse")
+    col3.metric("Pagos sin Factura (Huérfanos)", len(pagos_huerfanos), delta_color="inverse")
+    col4.metric("Facturas con Saldo Pendiente", len(facturas_pend))
 
     # Pestañas
-    t1, t2, t3, t4 = st.tabs(["🚦 Semáforo", "📑 Facturas Pendientes", "🔀 Cruces de Cuentas", "📉 Gráficos"])
+    t1, t2, t3, t4 = st.tabs(["🚦 Semáforo Contable", "📑 Facturas Pendientes", "❓ Pagos sin Factura", "📉 Gráficos"])
     
     with t1:
-        st.subheader("Conciliación por Cuenta")
-        ver_todo = st.toggle("Ver solo cuentas con problemas", value=False)
+        st.subheader("Conciliación de la Matemática de las Cuentas")
+        ver_todo = st.toggle("Ver solo cuentas con diferencias", value=False)
         df_show = df_audit[df_audit["estado"] != "🟢 OK"] if ver_todo else df_audit
         
         st.dataframe(
@@ -222,7 +213,7 @@ if uploaded_file:
             use_container_width=True,
             column_config={
                 "meta_saldo_inicial": st.column_config.NumberColumn("Saldo Inicial", format="$%.2f"),
-                "movimientos_netos": st.column_config.NumberColumn("Movimientos Netos", format="$%.2f"),
+                "movimientos_netos": st.column_config.NumberColumn("Neto (Cargos-Abonos)", format="$%.2f"),
                 "saldo_calculado": st.column_config.NumberColumn("Saldo Calculado", format="$%.2f"),
                 "saldo_final_aux": st.column_config.NumberColumn("Saldo Reporte", format="$%.2f"),
                 "diferencia": st.column_config.NumberColumn("Diferencia", format="$%.2f"),
@@ -231,28 +222,46 @@ if uploaded_file:
         st.download_button("Descargar Semáforo", to_excel(df_audit), "semaforo.xlsx")
         
     with t2:
-        st.subheader("Detalle de Facturas Vivas")
+        st.subheader("Detalle Operativo de Cobranza (Facturas Vivas)")
         st.dataframe(
-            facturas_pend.sort_values("fecha"),
+            facturas_pend[["cliente", "referencia_norm", "fecha_origen", "total_cargos", "total_abonos", "saldo_pendiente"]].sort_values("fecha_origen"),
             use_container_width=True,
-            column_config={"saldo": st.column_config.NumberColumn("Saldo Pendiente", format="$%.2f")}
+            column_config={
+                "cliente": "Cliente",
+                "referencia_norm": "Factura",
+                "fecha_origen": st.column_config.DateColumn("Fecha Inicial", format="DD/MM/YYYY"),
+                "total_cargos": st.column_config.NumberColumn("Cargos", format="$%.2f"),
+                "total_abonos": st.column_config.NumberColumn("Abonos", format="$%.2f"),
+                "saldo_pendiente": st.column_config.NumberColumn("Saldo por Cobrar", format="$%.2f")
+            }
         )
+        st.download_button("Descargar Pendientes", to_excel(facturas_pend), "pendientes_cobro.xlsx")
         
     with t3:
-        st.subheader("Referencias Cruzadas (Error común de aplicación de pagos)")
-        if df_cruces.empty:
-            st.success("✅ No se detectaron cruces de referencias entre cuentas.")
+        st.subheader("Pagos o Anticipos sin Factura Asociada")
+        if pagos_huerfanos.empty:
+            st.success("✅ Excelente: Todos los pagos tienen su factura correspondiente.")
         else:
-            st.warning("⚠️ Estas facturas tienen cargos en una cuenta y abonos en otra distinta.")
-            st.dataframe(df_cruces)
+            st.warning("⚠️ Ojo: Estos abonos se registraron, pero no se encontró la factura de origen en este reporte.")
+            st.dataframe(
+                pagos_huerfanos[["cliente", "referencia_norm", "fecha_origen", "total_abonos", "saldo_pendiente"]],
+                use_container_width=True,
+                column_config={
+                    "cliente": "Cliente",
+                    "referencia_norm": "Referencia del Pago",
+                    "fecha_origen": st.column_config.DateColumn("Fecha del Pago", format="DD/MM/YYYY"),
+                    "total_abonos": st.column_config.NumberColumn("Monto del Abono", format="$%.2f"),
+                    "saldo_pendiente": st.column_config.NumberColumn("Saldo a Favor", format="$%.2f")
+                }
+            )
             
     with t4:
         fig = go.Figure(data=[
-            go.Bar(name='Facturas OK', x=['Total'], y=[saldo_total - diferencia_total], marker_color='#2ecc71'),
-            go.Bar(name='Diferencias', x=['Total'], y=[diferencia_total], marker_color='#e74c3c')
+            go.Bar(name='Cuentas Cuadradas', x=['Matemática del Reporte'], y=[saldo_total - diferencia_total], marker_color='#2ecc71'),
+            go.Bar(name='Diferencia (Error de Captura/Reporte)', x=['Matemática del Reporte'], y=[diferencia_total], marker_color='#e74c3c')
         ])
-        fig.update_layout(barmode='stack', title="Calidad del Saldo")
+        fig.update_layout(barmode='stack', title="Salud Matemática de las Cuentas")
         st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.info("Esperando archivo...")
+    st.info("Esperando archivo CSV de CONTPAQ...")
