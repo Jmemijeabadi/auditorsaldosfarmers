@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import itertools
 from io import BytesIO
 import plotly.graph_objects as go
 
@@ -202,7 +203,7 @@ if uploaded_file:
     col4.metric("Facturas por Cobrar", len(facturas_pend))
 
     # ==============================================================================
-    # NUEVO: REPORTE EJECUTIVO AUTOMATIZADO
+    # REPORTE EJECUTIVO AUTOMATIZADO
     # ==============================================================================
     st.divider()
     with st.expander("🤖 Ver Análisis Ejecutivo Automático", expanded=True):
@@ -247,6 +248,64 @@ if uploaded_file:
 
         if not hubo_hallazgos:
             st.success("✅ La cartera se ve excepcionalmente limpia. La matemática cuadra perfectamente a cero y no se detectaron anomalías.")
+
+    # ==============================================================================
+    # 🕵️‍♂️ CAZADOR INTELIGENTE DE DESCUADRES (Buscador Forense)
+    # ==============================================================================
+    st.divider()
+    st.markdown("### 🕵️‍♂️ Cazador Forense de Fugas Contables")
+    st.info("¿Tienes una diferencia de dinero con otro sistema o estado de cuenta? Ingresa el monto exacto y la Inteligencia de la app buscará de dónde podría provenir.")
+    
+    col_search1, col_search2 = st.columns([1, 2])
+    
+    with col_search1:
+        fuga_buscada = st.number_input("Ingresa la cantidad exacta que no cuadra (Ej. 212216.41):", min_value=0.0, step=100.0, format="%.2f")
+    
+    with col_search2:
+        if fuga_buscada > 0.01:
+            st.markdown(f"**Resultados del rastreo para: ${fuga_buscada:,.2f}**")
+            encontrado = False
+            
+            # 1. Búsqueda de póliza individual (Directa)
+            movs_directos = movs[(abs(movs["cargos"] - fuga_buscada) < 0.1) | (abs(movs["abonos"] - fuga_buscada) < 0.1) | (abs(abs(movs["saldo_neto"]) - fuga_buscada) < 0.1)]
+            if not movs_directos.empty:
+                st.error(f"🚨 **¡Póliza Exacta Encontrada!** Hay movimientos individuales por exactamente esta cantidad.")
+                st.dataframe(movs_directos[["fecha_raw", "concepto", "referencia_norm", "cargos", "abonos"]], use_container_width=True)
+                encontrado = True
+                
+            # 2. Búsqueda de signo invertido (El error se duplica)
+            mitad_fuga = fuga_buscada / 2
+            movs_invertidos = movs[(abs(movs["cargos"] - mitad_fuga) < 0.1) | (abs(movs["abonos"] - mitad_fuga) < 0.1)]
+            if not movs_invertidos.empty:
+                st.warning(f"⚠️ **Posible Error de Captura (Signo Invertido):** Si alguien capturó un movimiento de **${mitad_fuga:,.2f}** al revés (ej. un cargo en lugar de abono), el descuadre se duplica y causa exactamente tu diferencia. Revisa esto:")
+                st.dataframe(movs_invertidos[["fecha_raw", "concepto", "referencia_norm", "cargos", "abonos"]], use_container_width=True)
+                encontrado = True
+
+            # 3. Búsqueda de saldo exacto por cliente
+            saldos_cliente = resumen_referencias.groupby("cliente")["saldo_pendiente"].sum().reset_index()
+            clientes_match = saldos_cliente[abs(saldos_cliente["saldo_pendiente"] - fuga_buscada) < 0.1]
+            if not clientes_match.empty:
+                st.info(f"💡 **Saldo Exacto de Cliente:** Esta diferencia coincide exactamente con el saldo vivo total de un cliente en específico:")
+                st.dataframe(clientes_match, use_container_width=True)
+                encontrado = True
+
+            # 4. Combinatoria Forense (Suma de 2 o 3 facturas pendientes)
+            if not encontrado:
+                pendientes_lista = facturas_pend.to_dict('records')
+                # Intentamos combinaciones de 2 y 3 facturas
+                for r in range(2, 4):
+                    for combo in itertools.combinations(pendientes_lista, r):
+                        suma_combo = sum(item['saldo_pendiente'] for item in combo)
+                        if abs(suma_combo - fuga_buscada) < 0.1:
+                            st.success(f"🎯 **¡Bingo (Suma Encontrada)!** Encontramos que la suma exacta de estas **{r} facturas pendientes** da tu diferencia:")
+                            df_combo = pd.DataFrame(combo)[["cliente", "referencia_norm", "saldo_pendiente"]]
+                            st.dataframe(df_combo, use_container_width=True)
+                            encontrado = True
+                            break # Mostramos solo el primer cruce exitoso
+                    if encontrado: break
+            
+            if not encontrado:
+                st.write("🕵️‍♂️ *El radar terminó de escanear. No se encontró ninguna póliza individual, cliente, signo invertido ni combinación de facturas que sumen esa cantidad dentro de este archivo. Es altamente probable que la diferencia provenga de facturas o movimientos omitidos en la plataforma antes de exportar el reporte base.*")
 
     st.divider()
 
