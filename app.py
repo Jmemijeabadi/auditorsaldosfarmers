@@ -14,7 +14,7 @@ UMBRAL_TOLERANCIA = 1.0
 st.title("🛡️🍴 Auditoría Master de Saldos (FARMERS)")
 st.markdown("""
 Esta herramienta está adaptada para el formato de reporte CSV y extrae inteligencia de negocio:
-1. **Lectura Blindada:** Cuadra el saldo inicial con los movimientos.
+1. **Lectura Blindada:** Cuadra el saldo inicial con los movimientos y detecta omisiones humanas.
 2. **Inteligencia Operativa:** Identifica el nombre del cliente por factura.
 3. **Análisis Ejecutivo:** Genera un reporte automático con los hallazgos críticos.
 """)
@@ -27,7 +27,7 @@ def normalizar_referencia_base(ref):
     """
     Extracción inteligente para emparejar 'Factura de Cliente A-2796' con 'Ap. Pago Cte. 1078 F. 2796'
     """
-    if pd.isna(ref): return None
+    if pd.isna(ref) or str(ref).strip() == "": return None
     s = str(ref).strip().upper()
     
     m_pago = re.search(r'F\.?\s*(\d+)', s)
@@ -95,6 +95,10 @@ def procesar_contpaq_engine(file):
         
     movs["fecha"] = pd.to_datetime(movs["fecha_raw"], errors="coerce")
     movs["referencia_norm"] = movs["referencia"].apply(normalizar_referencia_base)
+    
+    # ---> BLINDAJE: Si la celda viene vacía, la etiquetamos para que no se pierda la matemática <---
+    movs["referencia_norm"] = movs["referencia_norm"].fillna("⚠️ SIN REFERENCIA CAPTURADA")
+    
     movs["saldo_neto"] = movs["cargos"] - movs["abonos"]
     
     movs["cliente"] = np.where(
@@ -146,6 +150,9 @@ if uploaded_file:
             
             movs_validos = movs[movs["referencia_norm"].notna()]
             
+            # ---> NUEVO: AISLAR LOS CULPABLES DE LA DIFERENCIA <---
+            movs_sin_referencia = movs[movs["referencia_norm"] == "⚠️ SIN REFERENCIA CAPTURADA"].copy()
+            
             resumen_referencias = movs_validos.groupby(["meta_codigo", "referencia_norm"]).agg(
                 cliente=("cliente", "first"),
                 fecha_origen=("fecha", "min"),
@@ -161,7 +168,8 @@ if uploaded_file:
             
             pagos_huerfanos = resumen_referencias[
                 (resumen_referencias["total_cargos"] == 0) & 
-                (resumen_referencias["total_abonos"] > 0)
+                (resumen_referencias["total_abonos"] > 0) &
+                (resumen_referencias["referencia_norm"] != "⚠️ SIN REFERENCIA CAPTURADA") # Omitimos esto aquí para no duplicar la alerta
             ].copy()
 
             pagos_excedentes = resumen_referencias[
@@ -212,6 +220,20 @@ if uploaded_file:
             max_hue = pagos_huerfanos.loc[pagos_huerfanos['total_abonos'].idxmax()]
             st.info(f"💡 **{len(pagos_huerfanos)} Pagos de Periodos Anteriores (Huérfanos):** Entraron abonos sin una factura de cargo asociada en este reporte. El más alto es un abono de **{max_hue['cliente']}** por **${max_hue['total_abonos']:,.2f}** (Referencia: {max_hue['referencia_norm']}).")
             
+        # 4. NUEVO: DETECTOR DE FUGAS (MOVIMIENTOS EN BLANCO)
+        if not movs_sin_referencia.empty:
+            hubo_hallazgos = True
+            total_fuga = movs_sin_referencia['saldo_neto'].sum()
+            
+            st.error(f"🔍 **DETECTOR DE FUGAS (MOVIMIENTOS SIN REFERENCIA):** Se detectaron **{len(movs_sin_referencia)} movimientos** donde quien capturó dejó la descripción/referencia en blanco. Estos movimientos suman **${abs(total_fuga):,.2f}** y causaban las diferencias. La matemática de la app ahora cuadra porque los hemos agrupado, pero debes revisar estas pólizas en tu sistema.")
+            
+            st.markdown("**👇 Detalle de los movimientos sin referencia capturada:**")
+            st.dataframe(
+                movs_sin_referencia[["meta_codigo", "poliza", "fecha_raw", "concepto", "cargos", "abonos"]],
+                use_container_width=True,
+                hide_index=True
+            )
+
         if not hubo_hallazgos:
             st.success("✅ La cartera se ve excepcionalmente limpia. No se detectaron anomalías de captura ni pagos excedentes.")
 
