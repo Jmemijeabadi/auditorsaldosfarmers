@@ -25,11 +25,15 @@ Esta herramienta está adaptada para el formato de reporte CSV y extrae intelige
 
 def normalizar_referencia_base(ref):
     """
-    Extracción inteligente para emparejar 'Factura de Cliente A-2796' con 'Ap. Pago Cte. 1078 F. 2796'
+    BLINDAJE NIVEL 2: Atrapa nulos reales, celdas en blanco o textos fantasma de Excel como "nan" o "None"
     """
-    if pd.isna(ref) or str(ref).strip() == "": return None
-    s = str(ref).strip().upper()
+    if pd.isna(ref): return "⚠️ SIN REFERENCIA CAPTURADA"
     
+    s = str(ref).strip()
+    if not s or s.lower() in ["nan", "none", "null"]:
+        return "⚠️ SIN REFERENCIA CAPTURADA"
+        
+    s = s.upper()
     m_pago = re.search(r'F\.?\s*(\d+)', s)
     if m_pago: return m_pago.group(1)
     
@@ -59,8 +63,9 @@ def to_excel(df):
 # 2. PROCESAMIENTO CENTRAL (ENGINE)
 # ==============================================================================
 
+# Cambiamos el nombre de la función a 'procesar_contpaq_core' para destruir el caché anterior
 @st.cache_data
-def procesar_contpaq_engine(file):
+def procesar_contpaq_core(file):
     raw = cargar_archivo_robusto(file)
     raw_str = raw.astype(str)
     
@@ -94,11 +99,9 @@ def procesar_contpaq_engine(file):
         movs[c] = pd.to_numeric(movs[c], errors='coerce').fillna(0)
         
     movs["fecha"] = pd.to_datetime(movs["fecha_raw"], errors="coerce")
+    
+    # La limpieza se hace directamente desde la función, ya no necesitamos fillna
     movs["referencia_norm"] = movs["referencia"].apply(normalizar_referencia_base)
-    
-    # ---> BLINDAJE: Si la celda viene vacía, la etiquetamos para que no se pierda la matemática <---
-    movs["referencia_norm"] = movs["referencia_norm"].fillna("⚠️ SIN REFERENCIA CAPTURADA")
-    
     movs["saldo_neto"] = movs["cargos"] - movs["abonos"]
     
     movs["cliente"] = np.where(
@@ -122,8 +125,8 @@ def procesar_contpaq_engine(file):
 # ==============================================================================
 
 def analizar_saldos(movs, resumen):
-    vivas = movs[movs["referencia_norm"].notna()]
-    saldo_facturas = vivas.groupby(["meta_codigo"]).agg(movimientos_netos=("saldo_neto", "sum")).reset_index()
+    # Ya no filtramos a los vivos, mandamos TODOS para que sume los que no tienen referencia
+    saldo_facturas = movs.groupby(["meta_codigo"]).agg(movimientos_netos=("saldo_neto", "sum")).reset_index()
     
     df = resumen.merge(saldo_facturas, on="meta_codigo", how="left").fillna(0)
     df["saldo_calculado"] = df["meta_saldo_inicial"] + df["movimientos_netos"]
@@ -145,13 +148,13 @@ uploaded_file = st.file_uploader("📂 Sube reporte (CSV extraído de la platafo
 if uploaded_file:
     with st.spinner("🚀 Extrayendo clientes y generando análisis..."):
         try:
-            movs, resumen = procesar_contpaq_engine(uploaded_file)
+            # Mandamos llamar la nueva función sin caché
+            movs, resumen = procesar_contpaq_core(uploaded_file)
             df_audit = analizar_saldos(movs, resumen)
             
-            movs_validos = movs[movs["referencia_norm"].notna()]
-            
-            # ---> NUEVO: AISLAR LOS CULPABLES DE LA DIFERENCIA <---
+            # ---> AISLAMOS A LOS CULPABLES AQUÍ <---
             movs_sin_referencia = movs[movs["referencia_norm"] == "⚠️ SIN REFERENCIA CAPTURADA"].copy()
+            movs_validos = movs[movs["referencia_norm"] != "⚠️ SIN REFERENCIA CAPTURADA"]
             
             resumen_referencias = movs_validos.groupby(["meta_codigo", "referencia_norm"]).agg(
                 cliente=("cliente", "first"),
@@ -168,8 +171,7 @@ if uploaded_file:
             
             pagos_huerfanos = resumen_referencias[
                 (resumen_referencias["total_cargos"] == 0) & 
-                (resumen_referencias["total_abonos"] > 0) &
-                (resumen_referencias["referencia_norm"] != "⚠️ SIN REFERENCIA CAPTURADA") # Omitimos esto aquí para no duplicar la alerta
+                (resumen_referencias["total_abonos"] > 0)
             ].copy()
 
             pagos_excedentes = resumen_referencias[
@@ -177,7 +179,7 @@ if uploaded_file:
                 (resumen_referencias["saldo_pendiente"] < -0.01)
             ].copy()
             
-            # Buscar Notas de crédito o ajustes que pueden estar mal capturados
+            # Buscar Notas de crédito o ajustes manuales
             ajustes_sospechosos = movs[movs['concepto'].str.contains('Nota de Crédito|Ajuste', case=False, na=False)]
             
         except Exception as e:
@@ -203,29 +205,29 @@ if uploaded_file:
         
         hubo_hallazgos = False
         
-        # 1. Alerta de Notas de Crédito / Ajustes manuales
+        # 1. Alerta de Notas de Crédito / Ajustes
         if not ajustes_sospechosos.empty:
             hubo_hallazgos = True
-            st.error(f"🚨 **Riesgo de Mala Captura:** Se detectaron **{len(ajustes_sospechosos)}** movimientos manuales como *'Notas de Crédito'* o *'Ajustes'*. Revisa que quien los capturó haya puesto el número de factura correcto en la referencia. Por ejemplo, detectamos un movimiento con el concepto: *'{ajustes_sospechosos.iloc[0]['concepto']}'* por **${abs(ajustes_sospechosos.iloc[0]['saldo_neto']):,.2f}**.")
+            st.error(f"🚨 **Riesgo de Mala Captura:** Se detectaron **{len(ajustes_sospechosos)}** movimientos manuales como *'Notas de Crédito'* o *'Ajustes'*. Revisa que quien los capturó haya puesto el número de factura correcto.")
         
         # 2. Alerta de Pagos Excedentes
         if not pagos_excedentes.empty:
             hubo_hallazgos = True
             max_exc = pagos_excedentes.loc[pagos_excedentes['saldo_pendiente'].idxmin()]
-            st.warning(f"⚠️ **{len(pagos_excedentes)} Facturas Pagadas de Más:** Se detectaron facturas donde el abono supera al cargo. El caso más fuerte es la Factura **{max_exc['referencia_norm']}** de **{max_exc['cliente']}**, que tiene un saldo a favor (negativo) de **${abs(max_exc['saldo_pendiente']):,.2f}**.")
+            st.warning(f"⚠️ **{len(pagos_excedentes)} Facturas Pagadas de Más:** Se detectaron facturas donde el abono supera al cargo.")
             
         # 3. Alerta de Pagos Huérfanos
         if not pagos_huerfanos.empty:
             hubo_hallazgos = True
             max_hue = pagos_huerfanos.loc[pagos_huerfanos['total_abonos'].idxmax()]
-            st.info(f"💡 **{len(pagos_huerfanos)} Pagos de Periodos Anteriores (Huérfanos):** Entraron abonos sin una factura de cargo asociada en este reporte. El más alto es un abono de **{max_hue['cliente']}** por **${max_hue['total_abonos']:,.2f}** (Referencia: {max_hue['referencia_norm']}).")
+            st.info(f"💡 **{len(pagos_huerfanos)} Pagos de Periodos Anteriores (Huérfanos):** Entraron abonos sin una factura de cargo asociada en este reporte.")
             
-        # 4. NUEVO: DETECTOR DE FUGAS (MOVIMIENTOS EN BLANCO)
+        # 4. EL DETECTOR QUE ESTÁBAMOS BUSCANDO
         if not movs_sin_referencia.empty:
             hubo_hallazgos = True
             total_fuga = movs_sin_referencia['saldo_neto'].sum()
             
-            st.error(f"🔍 **DETECTOR DE FUGAS (MOVIMIENTOS SIN REFERENCIA):** Se detectaron **{len(movs_sin_referencia)} movimientos** donde quien capturó dejó la descripción/referencia en blanco. Estos movimientos suman **${abs(total_fuga):,.2f}** y causaban las diferencias. La matemática de la app ahora cuadra porque los hemos agrupado, pero debes revisar estas pólizas en tu sistema.")
+            st.error(f"🔍 **DETECTOR DE FUGAS (MOVIMIENTOS SIN REFERENCIA):** Se detectaron **{len(movs_sin_referencia)} movimientos** donde quien capturó dejó la descripción/referencia en blanco. Estos movimientos suman un neto de **${abs(total_fuga):,.2f}** y causaban las diferencias. La matemática de la app ahora cuadra porque los hemos agrupado, pero debes revisar estas pólizas en tu sistema.")
             
             st.markdown("**👇 Detalle de los movimientos sin referencia capturada:**")
             st.dataframe(
@@ -234,8 +236,13 @@ if uploaded_file:
                 hide_index=True
             )
 
+        # Si a pesar de agrupar todo sigue habiendo una diferencia (error de la plataforma o fechas raras)
+        if abs(diferencia_total) > UMBRAL_TOLERANCIA:
+            hubo_hallazgos = True
+            st.error(f"❌ **DIFERENCIA IRRECONCILIABLE:** Hay una diferencia global de **${diferencia_total:,.2f}** que no proviene de faltas de captura de referencia. Revisa las cuentas en el Semáforo Contable.")
+
         if not hubo_hallazgos:
-            st.success("✅ La cartera se ve excepcionalmente limpia. No se detectaron anomalías de captura ni pagos excedentes.")
+            st.success("✅ La cartera se ve excepcionalmente limpia. No se detectaron anomalías.")
 
     st.divider()
 
